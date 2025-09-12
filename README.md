@@ -15,4 +15,3 @@ It uses a *contrastive loss* approach to learn feature embeddings for a **fixed 
 
 ---
 
-## 📂 Directory Structure
