@@ -1,0 +1,146 @@
+mport torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, models
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import os
+
+# Dataset for pairs: fixed CAD image paired with printed gear images labeled as match/non-match
+class GearDataset(Dataset):
+    def __init__(self, cad_image_path, printed_image_folder, transform, labels):
+        """
+        cad_image_path: path to your single CAD image
+        printed_image_folder: folder containing printed gear images
+        labels: dict {image_filename: label} 1=match,0=no match
+        transform: torchvision transforms
+        """
+        self.cad_image = Image.open(cad_image_path).convert('RGB')
+        self.printed_images_paths = [os.path.join(printed_image_folder, f) for f in os.listdir(printed_image_folder)]
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.printed_images_paths)
+
+    def __getitem__(self, idx):
+        printed_img_path = self.printed_images_paths[idx]
+        printed_img = Image.open(printed_img_path).convert('RGB')
+        
+        if self.transform:
+            cad_img_transformed = self.transform(self.cad_image)
+            printed_img_transformed = self.transform(printed_img)
+        
+        # Extract filename and look up label
+        fname = os.path.basename(printed_img_path)
+        label = self.labels.get(fname, 0)  # default to 0 (no match) if not found
+        
+        return cad_img_transformed, printed_img_transformed, torch.tensor([label], dtype=torch.float32)
+
+# Feature extractor with pretrained ResNet18
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super(FeatureExtractor, self).__init__()
+        self.backbone = models.resnet18(pretrained=True)
+        self.backbone.fc = nn.Identity()  # remove final layer, output embedding vector
+
+    def forward(self, x):
+        return self.backbone(x)
+
+# Siamese network architecture
+class SiameseNetwork(nn.Module):
+    def __init__(self):
+        super(SiameseNetwork, self).__init__()
+        self.feature_extractor = FeatureExtractor()
+
+    def forward(self, x1, x2):
+        f1 = self.feature_extractor(x1)
+        f2 = self.feature_extractor(x2)
+        return f1, f2
+
+# Contrastive loss
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=2.0):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, output1, output2, label):
+        dist = nn.functional.pairwise_distance(output1, output2)
+        loss = torch.mean(label * dist.pow(2) + (1 - label) * torch.clamp(self.margin - dist, min=0).pow(2))
+        return loss
+
+
+def train(model, dataloader, criterion, optimizer, device, epochs=10):
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0
+        for cad_img, print_img, label in dataloader:
+            cad_img, print_img, label = cad_img.to(device), print_img.to(device), label.to(device)
+
+            optimizer.zero_grad()
+            output1, output2 = model(cad_img, print_img)
+            loss = criterion(output1, output2, label)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(dataloader):.4f}")
+
+def infer(model, cad_image_path, printed_image_path, transform, device, threshold=1.0):
+    model.eval()
+
+    cad_img = Image.open(cad_image_path).convert('RGB')
+    printed_img = Image.open(printed_image_path).convert('RGB')
+
+    cad_img_t = transform(cad_img).unsqueeze(0).to(device)
+    printed_img_t = transform(printed_img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        f1, f2 = model(cad_img_t, printed_img_t)
+        dist = nn.functional.pairwise_distance(f1, f2)
+        print(f"Distance between CAD and printed gear: {dist.item():.4f}")
+        if dist.item() < threshold:
+            print("Match detected!")
+            return True
+        else:
+            print("No match.")
+            return False
+
+if __name__ == "__main__":
+    # Paths
+    cad_image_path = "your_cad_image.png"  # replace with your CAD model image path
+    printed_image_folder = "printed_images"  # folder with printed gear images
+
+    # Create a labels dictionary: filename -> 1 or 0
+    # Example: {"print_good_1.png": 1, "print_bad_1.png": 0}
+    labels = {
+        # Fill this dict after you have your printed images
+    }
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    dataset = GearDataset(cad_image_path, printed_image_folder, transform, labels)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+
+    model = SiameseNetwork().to(device)
+
+    criterion = ContrastiveLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    # TRAINING
+    # train(model, dataloader, criterion, optimizer, device, epochs=10)
+
+    # Save model after training
+    # torch.save(model.state_dict(), "gear_siamese_model.pth")
+
+    # INFERENCE EXAMPLE
+    # Replace printed_test_image.png with your new printed gear image
+    # infer(model, cad_image_path, "printed_images/printed_test_image.png", transform, device, threshold=1.0)
